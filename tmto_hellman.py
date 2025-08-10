@@ -1,17 +1,21 @@
 """
 Hellman Time–Memory Tradeoff Demo
 
-Builds Hellman tables with truncated hashes and then attempts to invert
-random hashes via a time–memory tradeoff attack. Uses multiprocessing
-for both table construction and attack.
+Features:
+- Builds Hellman tables using truncated hashes for time–memory tradeoff attacks.
+- Supports configurable number of tables, chains, chain length, and hash/message/truncate lengths.
+- Allows selection of hash algorithm from those supported by hashlib.
+- Uses multiprocessing for efficient parallel table construction and attack execution.
+- Performs a configurable number of random-message attacks to attempt hash inversion.
+- Saves results, timings, and configuration to a JSON output file.
+- Supports progress bars and quiet mode for reduced output.
 """
 
-# TODO: refactor code
-# annotations; change print() to logging()
 import argparse
 import dataclasses
 import hashlib
 import json
+import logging
 import multiprocessing
 import os
 import signal
@@ -19,7 +23,7 @@ import sys
 import time
 from datetime import datetime
 from random import getrandbits
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from tqdm.auto import tqdm
 
@@ -41,15 +45,35 @@ class TMTOConfig:
 def truncated_hash(
     data: bytes, hash_algorithm: str, truncate_length: int
 ) -> bytes:
-    """Compute hash with algorithm `hash_algorithm` on `data` and return last `truncate_length` bytes."""
+    """
+    Computes the hash of the `data` using `hash_algorithm` and returns the last `truncate_length` bytes.
+
+    :param data: Input data to hash.
+    :type data: bytes
+    :param hash_algorithm: Hash algorithm name (e.g., 'sha256', 'sha512').
+    :type hash_algorithm: str
+    :param truncate_length: Number of bytes to keep from the end of the hash.
+    :type truncate_length: int
+    :return: Truncated hash digest.
+    :rtype: bytes
+    """
     h = hashlib.new(hash_algorithm)
     h.update(data)
     digest = h.digest()
     return digest[-truncate_length:]
 
 
-def redundancy_function(r: bytes, x: bytes) -> bytes:
-    """Reduction: prepend the salt `r` to input `x`."""
+def apply_salt(r: bytes, x: bytes) -> bytes:
+    """
+    Applies the salt `r` to the input `x`.
+
+    :param r: Salt value.
+    :type r: bytes
+    :param x: Input value.
+    :type x: bytes
+    :return: Salted input.
+    :rtype: bytes
+    """
     return r + x
 
 
@@ -61,8 +85,21 @@ def precompute_table(
     message_length: int,
 ) -> Tuple[Dict[bytes, bytes], bytes]:
     """
-    Build one Hellman table of `num_chains` chains (length `chain_length`) using `hash_algorithm` and truncate to `truncate_length` bytes.
-    Salt length is chosen so that len(r) + `truncate_length` = `message_length`.
+    Builds a Hellman table with the `num_chains` number of chains and `chain_length` chain length, using `hash_algorithm` and truncation.
+    The salt length is chosen so that len(salt) + `truncate_length` = `message_length`.
+
+    :param num_chains: Number of chains in the table.
+    :type num_chains: int
+    :param chain_length: Length of each chain.
+    :type chain_length: int
+    :param hash_algorithm: Hash algorithm name (e.g., 'sha256', 'sha512').
+    :type hash_algorithm: str
+    :param truncate_length: Number of bytes to keep from the end of the hash.
+    :type truncate_length: int
+    :param message_length: Length of random messages in bytes.
+    :type message_length: int
+    :return: Tuple containing the precomputed table (dict mapping final hash to initial value) and the salt used for the chains.
+    :rtype: Tuple[Dict[bytes, bytes], bytes]
     """
     salt_len = message_length - truncate_length
     r = getrandbits(8 * salt_len).to_bytes(salt_len, "big")
@@ -73,23 +110,34 @@ def precompute_table(
         xi = x0
         for _ in range(chain_length):
             xi = truncated_hash(
-                redundancy_function(r, xi), hash_algorithm, truncate_length
+                apply_salt(r, xi), hash_algorithm, truncate_length
             )
         table[xi] = x0
     return table, r
 
 
-def precompute_table_wrapper(
+def wrapper_precompute_table(
     task: Tuple[int, int, str, int, int],
 ) -> Tuple[Dict[bytes, bytes], bytes]:
-    """Unpacks `task` for `precompute_table()`."""
+    """
+    Unpacks `task` for `precompute_table()`.
+
+    :param task: Tuple of arguments for `precompute_table()`.
+    :type task: Tuple[int, int, str, int, int]
+    :return: Tuple containing the precomputed table (dict mapping final hash to initial value) and the salt used for the chains.
+    :rtype: Tuple[Dict[bytes, bytes], bytes]
+    """
     return precompute_table(*task)
 
 
 def build_tables(config: TMTOConfig) -> List[Tuple[Dict[bytes, bytes], bytes]]:
     """
-    Build `tables` Hellman tables in parallel using original functions.
-    Returns list of (table, salt).
+    Builds multiple Hellman tables in parallel according to the `config`.
+
+    :param config: TMTOConfig object containing configuration parameters.
+    :type config: TMTOConfig
+    :return: List of tuples, each containing a precomputed table (dict mapping final hash to initial value) and the salt used for the chains.
+    :rtype: List[Tuple[Dict[bytes, bytes], bytes]]
     """
     tasks = [
         (
@@ -108,7 +156,7 @@ def build_tables(config: TMTOConfig) -> List[Tuple[Dict[bytes, bytes], bytes]]:
 
         try:
             for table in tqdm(
-                pool.imap_unordered(precompute_table_wrapper, tasks),
+                pool.imap_unordered(wrapper_precompute_table, tasks),
                 total=config.num_tables,
                 desc="Building tables",
                 disable=config.quiet_mode,
@@ -130,46 +178,43 @@ def search_preimage(
     truncate_length: int,
 ) -> Optional[Tuple[bytes, int]]:
     """
-    Try to find x such that H(r||x)=`h` using Hellman tables.
+    Attempts to find a preimage x such that H(r||x) equals the target hash `h` using the Hellman tables.
 
-    :param h: Description
+    :param h: Target truncated hash to find a preimage for.
     :type h: bytes
-    :param precomputed_tables: Description
-    :type precomputed_tables: list[tuple[dict[bytes, bytes], bytes]]
-    :param chain_length: Description
+    :param precomputed_tables: List of precomputed tables, each a tuple of (table, salt).
+    :type precomputed_tables: List[Tuple[Dict[bytes, bytes], bytes]]
+    :param chain_length: Length of each chain.
     :type chain_length: int
-    :param hash_algorithm: Description
+    :param hash_algorithm: Hash algorithm name (e.g., 'sha256', 'sha512').
     :type hash_algorithm: str
-    :param truncate_length: Description
+    :param truncate_length: Number of bytes to keep from the end of the hash.
     :type truncate_length: int
-    :return: Description
-    :rtype: tuple[bytes, int] | None
+    :return: Tuple containing the found preimage and the number of steps taken to find it, or None if no preimage is found.
+    :rtype: Optional[Tuple[bytes, int]]
     """
     cur = [h] * len(precomputed_tables)
     for j in range(chain_length):
-        for idx, (tbl, r) in enumerate(precomputed_tables):
-            y = cur[idx]
-            if y in tbl:
-                x0 = tbl[y]
-                x = x0
+        for table_idx, (table, r) in enumerate(precomputed_tables):
+            y = cur[table_idx]
+            if y in table:
+                x = table[y]
                 for _ in range(chain_length - j - 1):
                     x = truncated_hash(
-                        redundancy_function(r, x),
-                        hash_algorithm,
-                        truncate_length,
+                        apply_salt(r, x), hash_algorithm, truncate_length
                     )
                     if (
                         truncated_hash(
-                            redundancy_function(r, x),
-                            hash_algorithm,
-                            truncate_length,
+                            apply_salt(r, x), hash_algorithm, truncate_length
                         )
                         == h
                     ):
-                        return (redundancy_function(r, x), j)
+                        return (apply_salt(r, x), j)
             else:
-                cur[idx] = truncated_hash(
-                    redundancy_function(r, y), hash_algorithm, truncate_length
+                cur[table_idx] = truncated_hash(
+                    apply_salt(r, y),
+                    hash_algorithm,
+                    truncate_length,
                 )
     return None
 
@@ -180,8 +225,23 @@ def perform_attack(
     hash_algorithm: str,
     truncate_length: int,
     message_length: int,
-) -> Optional[Dict[str, str | int]]:
-    """Perform one random-message attack trial."""
+) -> Optional[Dict[str, Union[str, int]]]:
+    """
+    Performs a single attack attempt on a random message using the Hellman tables.
+
+    :param precomputed_tables: List of precomputed tables, each a tuple of (table, salt).
+    :type precomputed_tables: List[Tuple[Dict[bytes, bytes], bytes]]
+    :param chain_length: Length of each chain.
+    :type chain_length: int
+    :param hash_algorithm: Hash algorithm name (e.g., 'sha256', 'sha512').
+    :type hash_algorithm: str
+    :param truncate_length: Number of bytes to keep from the end of the hash.
+    :type truncate_length: int
+    :param message_length: Length of random messages in bytes.
+    :type message_length: int
+    :return: Dictionary containing the original message, its hash, the found preimage, and the number of steps taken to find it, or None if no preimage is found.
+    :rtype: Optional[Dict[str, Union[str, int]]]
+    """
     message = getrandbits(8 * message_length).to_bytes(message_length, "big")
     h = truncated_hash(message, hash_algorithm, truncate_length)
     found = search_preimage(
@@ -198,16 +258,16 @@ def perform_attack(
     return None
 
 
-def perform_attack_wrapper(
+def wrapper_perform_attack(
     task: Tuple[List[Tuple[Dict[bytes, bytes], bytes]], int, str, int, int],
-) -> Optional[Dict[str, str | int]]:
+) -> Optional[Dict[str, Union[str, int]]]:
     """
-    Docstring for perform_attack_wrapper
+    Unpacks `task` for `perform_attack()`.
 
-    :param task: Description
-    :type task: tuple[list[tuple[dict[bytes, bytes], bytes]], int, str, int, int]
-    :return: Description
-    :rtype: dict[str, Any] | None
+    :param task: Tuple of arguments for `perform_attack()`.
+    :type task: Tuple[List[Tuple[Dict[bytes, bytes], bytes]], int, str, int, int]
+    :return: Dictionary containing the original message, its hash, the found preimage, and the number of steps taken to find it, or None if no preimage is found.
+    :rtype: Optional[Dict[str, Union[str, int]]]
     """
     return perform_attack(*task)
 
@@ -215,8 +275,20 @@ def perform_attack_wrapper(
 def run_attacks(
     precomputed_tables: List[Tuple[Dict[bytes, bytes], bytes]],
     config: TMTOConfig,
-):
-    """Perform `attacks` attack(s) and return list of results."""
+    start_time: float,
+) -> None:
+    """
+    Runs multiple attack attempts in parallel and saves results to the output file.
+
+    :param precomputed_tables: List of precomputed tables, each a tuple of (table, salt).
+    :type precomputed_tables: List[Tuple[Dict[bytes, bytes], bytes]]
+    :param config: TMTOConfig object containing configuration parameters.
+    :type config: TMTOConfig
+    :param start_time: Start time of the attack process, used to calculate total attack time.
+    :type start_time: float
+    :return: None
+    :rtype: None
+    """
     tasks = [
         (
             precomputed_tables,
@@ -235,7 +307,7 @@ def run_attacks(
 
         try:
             for attack in tqdm(
-                pool.imap_unordered(perform_attack_wrapper, tasks),
+                pool.imap_unordered(wrapper_perform_attack, tasks),
                 total=config.num_attacks,
                 desc="Attacking",
                 disable=config.quiet_mode,
@@ -249,16 +321,28 @@ def run_attacks(
         finally:
             with open(config.output, "r+") as output_file:
                 data = json.load(output_file)
+                attack_time = time.time() - start_time
+                data["attack_time"] = attack_time
                 data["results"] = results
                 data["preimages_found"] = len(results)
-                json.dump(data, output_file, indent=4)
+
+                output_file.seek(0)
+                json.dump(data, output_file, indent=2)
+                output_file.truncate()
 
             if interrupted:
                 sys.exit(1)
 
 
 def validate_arguments(parser: argparse.ArgumentParser) -> TMTOConfig:
-    """Validate CLI arguments."""
+    """
+    Validates command-line arguments and returns a TMTOConfig object.
+
+    :param parser: Argument parser instance to validate arguments against.
+    :type parser: argparse.ArgumentParser
+    :return: TMTOConfig object containing validated configuration parameters.
+    :rtype: TMTOConfig
+    """
     args = parser.parse_args()
     positive_entries = {
         "K": "num_chains",
@@ -268,6 +352,7 @@ def validate_arguments(parser: argparse.ArgumentParser) -> TMTOConfig:
         "m": "message_length",
     }
 
+    # Check that all positive arguments are greater than 0
     for short_name, name in positive_entries.items():
         arg = getattr(args, name)
         if arg <= 0:
@@ -318,6 +403,12 @@ def validate_arguments(parser: argparse.ArgumentParser) -> TMTOConfig:
 
 
 def setup_argparse() -> TMTOConfig:
+    """
+    Set up and validate command-line arguments.
+
+    :return: TMTOConfig object containing validated configuration parameters.
+    :rtype: TMTOConfig
+    """
     parser = argparse.ArgumentParser(
         description="Hellman time-memory tradeoff attack demo",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -327,64 +418,72 @@ def setup_argparse() -> TMTOConfig:
         "--chains",
         dest="num_chains",
         type=int,
+        metavar="K",
         default=2**12,
-        help="number of chains",
+        help="Number of chains per Hellman table (K > 0).",
     )
     parser.add_argument(
         "-T",
         "--tables",
         dest="num_tables",
         type=int,
+        metavar="T",
         default=1,
-        help="number of tables",
+        help="Number of Hellman tables to build (T > 0).",
     )
     parser.add_argument(
         "-A",
         "--attacks",
         dest="num_attacks",
         type=int,
+        metavar="A",
         default=10000,
-        help="number of attack attempts",
+        help="Number of random-message attack attempts to perform (A > 0).",
     )
     parser.add_argument(
         "-L",
         "--chain-length",
         dest="chain_length",
         type=int,
+        metavar="L",
         default=2**6,
-        help="chain length",
+        help="Length of each chain in the Hellman tables (L > 0).",
     )
     parser.add_argument(
         "-m",
         "--message-length",
         dest="message_length",
         type=int,
+        metavar="m",
         default=32,
-        help="length of random-messages in bytes",
+        help="Length in bytes of each random message and hash input (m > 0).",
     )
     parser.add_argument(
         "-t",
         "--truncate-length",
         dest="truncate_length",
         type=int,
+        metavar="t",
         default=2,
-        help="number of bytes to truncate from digest",
+        help="Number of bytes to keep from the end of each hash digest (0 <= t < m).",
     )
     parser.add_argument(
         "-w",
         "--workers",
         dest="max_workers",
         type=int,
+        metavar="w",
         default=None,
-        help="number of worker processes to use for table building/attack (defaults to CPU count)",
+        help="Number of worker processes for parallel table building and attacks (w > 0, defaults to CPU count).",
     )
     parser.add_argument(
         "-a",
         "--algorithm",
         dest="hash_algorithm",
         choices=hashlib.algorithms_available,
+        metavar="a",
         default="sha512",
-        help="hash algorithm (any supported by hashlib)",
+        help="Hash algorithm to use for all hashing (any supported by hashlib).",
     )
     parser.add_argument(
         "-o",
@@ -393,14 +492,14 @@ def setup_argparse() -> TMTOConfig:
         type=str,
         metavar="PATH",
         default=f"tmto_hellman_{datetime.now().strftime('%Y-%m-%d_%H.%M.%S')}.json",
-        help="Path to output file where results will be saved",
+        help="Path to output file for saving results.",
     )
     parser.add_argument(
         "-q",
         "--quiet",
         dest="quiet_mode",
         action="store_true",
-        help="suppress progress bars and extra output",
+        help="Suppress progress bars and extra output.",
     )
 
     return validate_arguments(parser)
@@ -408,6 +507,11 @@ def setup_argparse() -> TMTOConfig:
 
 def main():
     config = setup_argparse()
+
+    logging.basicConfig(
+        level=logging.INFO if not config.quiet_mode else logging.WARNING,
+        format="%(message)s",
+    )
 
     output_template = {
         "arguments": {
@@ -429,7 +533,7 @@ def main():
     }
 
     with open(config.output, "w") as output_file:
-        json.dump(output_template, output_file, indent=4)
+        json.dump(output_template, output_file, indent=2)
 
     # Precomputation
     start_time = time.time()
@@ -441,25 +545,25 @@ def main():
         data["precomputation_time"] = precomp_time
 
         output_file.seek(0)
-        json.dump(data, output_file, indent=4)
+        json.dump(data, output_file, indent=2)
         output_file.truncate()
-    if not config.quiet_mode:
-        print(
-            f"Built {config.num_tables} table(s) [algo={config.hash_algorithm}, trunc={config.truncate_length}] in {precomp_time:.2f}s"
-        )
+
+    logging.info(
+        f"Built {config.num_tables} table(s) [algorithm={config.hash_algorithm}, truncate-length={config.truncate_length}] in {precomp_time:.2f}s"
+    )
 
     # Attacks
     start_time = time.time()
-    run_attacks(precomputed_tables, config)
-    attack_time = time.time() - start_time
+    run_attacks(precomputed_tables, config, start_time)
 
     with open(config.output, "r") as output_file:
         data = json.load(output_file)
         preimages_found = data["preimages_found"]
-    if not config.quiet_mode:
-        print(
-            f"Attacks: {preimages_found}/{config.num_attacks} succeeded in {attack_time:.2f}s"
-        )
+        attack_time = data["attack_time"]
+
+    logging.info(
+        f"Attacks: {preimages_found}/{config.num_attacks} succeeded in {attack_time:.2f}s"
+    )
 
 
 if __name__ == "__main__":
