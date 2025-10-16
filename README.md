@@ -1,27 +1,24 @@
 # Hellman Time-Memory Tradeoff (TMTO) Demo
-A simple, configurable script that builds Hellman-style time-memory tradeoff tables using truncated hashes and attempts randomized preimage attacks against those tables.
+A simple, configurable CLI script that builds Hellman-style time-memory tradeoff tables using truncated hashes and attempts randomized preimage attacks against those tables.
 ## How it works
-A Hellman time-memory tradeoff (TMTO) precomputes many short chains of reduced hash values so later hash invertion queries are much faster. Instead of storing every `input -> hash` pair, the program stores only chain endpoints. During an attack it locates matching endpoint and then regenerates the corresponding chain to recover a candidate preimage.
+A Hellman time-memory tradeoff (TMTO) precomputes many short chains of reduced hash values so later hash inversion queries are much faster. Instead of storing every `input -> hash` pair, the program stores only chain endpoints. During an attack it locates matching endpoint and then regenerates the corresponding chain to recover a candidate preimage.
 ### Overview - core idea
-- Build many chains that cover parts of the reduced hash space.
-- Save only each chain's endpoint -> start mapping.
-- At query time, walk possible chain positions backwards to find an endpoint, then expand that chain forward to verify a true preimage.
-### Steps
- 
-1. Truncated hash:  
-    In a demo truncated suffixes (last `t` digest) of the actual hashes (`H(r || x)`) are used in order to reduce possible hash-bytes combinations.
-2. Tables:  
-    For each table a single salt `r` is randomly chosen to prevent table overlapping.
-3. Chains:  
-    Each chain start with random `x0` of `t` bytes from which following chain values are computed (`x_{i+1} = Trunc(H(r || x))`). After `L` steps final values is stored in the table mapping (`final -> x0`).
-4. Attack:
-    For a random message `message` the truncated hash `h` is computed.
-    Using Hellman lookups the algorightm searches for a chain that could generate `h`. If an endpoint matches, the corresponding chain head `x0` is expanded forward to try to find the exact preimage. 
+- **Truncated hash:**  
+Compute `Trunc(H(r || x))` by taking the last `t` bytes of the hash digest. Truncation reduces the effective search space to <code>N = 2<sup>8t</sup></code>, which increases the probability of collisions in the truncated space.
+- **Tables:**  
+Each table gets a random salt `r` (so `len(r) + t = m`). The salt reduces overlap between the portions of the space tables cover.
+- **Chains:**  
+Each chain starts with a random <code>x<sub>0</sub></code> of `t` bytes. Chain values are computed as <code>x<sub>i+1</sub> = Trunc(H(r || x<sub>i</sub>))</code>.  
+After `L` steps final value is stored in the table as a mapping <code>x<sub>L</sub> -> x<sub>0</sub></code>.
+- **Attack:**  
+    1. Given a target message `message`, compute `h = Trunc(H(message))`.
+    2. For each table, repeatedly compute the next chain value from `h` using table's salt `r` (treating `h` as if it could be part of a chain) and check each value against the table's endpoints. Continue up to `L` steps or until value matches a known endpoint.
+    3. For a matching endpoint, expand the chain forward from stored <code>x<sub>0</sub></code> to find message that produces `h`.
 ## Features
 - Build multiple Hellman tables in parallel (`multiprocessing`).
 - High number of configuration options.
 - Progress bars (`tqdm`) with queit mode.
-- Saves timings, configuration and results to a JSON output file.
+- Saves timings, configuration and results to a JSON output file (even if interrupted).
 ## Requirements
 Script need `tqdm` module for progress bars and should be installed with:  
 `pip install tqdm`
@@ -54,6 +51,7 @@ options:
 ```
 ## Output format
 ```markdown
+{
   "arguments": {
     "--num-chains": 4096,
     "--num-tables": 1,
@@ -77,4 +75,8 @@ options:
       "steps": 27
     },
     ...
+  ]
+}
 ```
+## License
+MIT License &copy; 2025 Yurii Ptashnyk
