@@ -21,7 +21,9 @@ After `L` steps final value is stored in the table as a mapping <code>x<sub>L</s
 - Saves timings, configuration and results to a JSON output file (even if interrupted).
 ## Requirements
 Script need `tqdm` module for progress bars and should be installed with:  
-`pip install tqdm`
+```markdown
+pip install tqdm
+```
 ## Usage
 ```markdown
 usage: tmto_hellman.py [-h] [-K K] [-T T] [-A A] [-L L] [-m m] [-t t] [-w w] [-a a] [-o PATH] [-q]
